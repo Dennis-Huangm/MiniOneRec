@@ -10,6 +10,7 @@ import datetime
 import torch
 from tqdm import tqdm
 import numpy as np
+import sys
 
 
 def clean_text(text):
@@ -77,14 +78,23 @@ def load_metadata_json2csv_style(category, metadata_file=None):
     remove_items = set()
     
     for meta in tqdm(metadata, desc="Processing metadata"):
-        if ('title' not in meta) or (meta['title'].find('<span id') > -1):
+        # if ('title' not in meta) or (meta['title'].find('<span id') > -1):
+        #     remove_items.add(meta['asin'])
+        #     continue
+        if 'title' not in meta:
             remove_items.add(meta['asin'])
             continue
         
         # Clean title like json2csv
-        meta['title'] = meta["title"].replace("&quot;", "\"").replace("&amp;", "&").strip(" ").strip("\"")
+        # meta['title'] = meta["title"].replace("&quot;", "\"").replace("&amp;", "&").strip(" ").strip("\"")
+        meta['title'] = str(meta["title"]).strip()
         
-        if len(meta['title']) > 1 and len(meta['title'].split(" ")) <= 20:
+        # if len(meta['title']) > 1 and len(meta['title'].split(" ")) <= 20:
+        #     id_title[meta['asin']] = meta['title']
+        #     # Store full metadata for later use
+        # else:
+        #     remove_items.add(meta['asin'])
+        if len(meta['title']) > 0:
             id_title[meta['asin']] = meta['title']
             # Store full metadata for later use
         else:
@@ -108,8 +118,12 @@ def load_reviews_json2csv_style(category, reviews_file=None, start_timestamp=Non
                 return []
     else:
         try:
-            with open(reviews_file) as f:
-                reviews = [json.loads(line) for line in f]
+            file_size = os.path.getsize(reviews_file)
+            reviews = []
+            with open(reviews_file) as f, tqdm(total=file_size, unit='B', unit_scale=True, desc="Loading reviews") as pbar:
+                for line in f:
+                    reviews.append(json.loads(line))
+                    pbar.update(len(line.encode('utf-8')))
         except FileNotFoundError:
             print(f"Reviews file {reviews_file} not found")
             return []
@@ -454,12 +468,12 @@ def process_dataset_recursive(args, metadata, reviews, start_timestamp, end_time
     print(f"After filtering: {len(user_counts)} users, {len(item_counts)} items, {len(filtered_reviews)} reviews")
     
     # Check if we need to expand time range (like json2csv)
-    if args.st_year > 1996 and len(item_counts) < 3000:
-        print(f"Items count {len(item_counts)} < 3000, expanding time range...")
-        args.st_year -= 1
-        new_start_timestamp = get_timestamp_start(args.st_year, args.st_month)
-        print(f"New time range: {args.st_year}-{args.st_month} to {args.ed_year}-{args.ed_month}")
-        return process_dataset_recursive(args, metadata, reviews, new_start_timestamp, end_timestamp)
+    # if args.st_year > 1996 and len(item_counts) < 3000:
+    #     print(f"Items count {len(item_counts)} < 3000, expanding time range...")
+    #     args.st_year -= 1
+    #     new_start_timestamp = get_timestamp_start(args.st_year, args.st_month)
+    #     print(f"New time range: {args.st_year}-{args.st_month} to {args.ed_year}-{args.ed_month}")
+    #     return process_dataset_recursive(args, metadata, reviews, new_start_timestamp, end_timestamp)
     
     return filtered_reviews, user_counts, item_counts, metadata, id_title
 
@@ -487,8 +501,8 @@ if __name__ == '__main__':
     print(f'K-core threshold: {args.user_k}')
     
     # Set time range
-    start_timestamp = get_timestamp_start(args.st_year, args.st_month)
-    end_timestamp = get_timestamp_start(args.ed_year, args.ed_month)
+    start_timestamp = 0
+    end_timestamp = sys.maxsize
     
     # Load reviews first (without timestamp filtering)
     print("Loading reviews...")
