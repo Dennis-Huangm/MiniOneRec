@@ -8,7 +8,7 @@ import collections
 from tqdm import tqdm
 # 新增：引入 datasets 库
 try:
-    from datasets import load_from_disk, Dataset, DatasetDict
+    from datasets import load_from_disk, load_dataset, Dataset, DatasetDict
 except ImportError:
     print("Please install datasets: pip install datasets")
     exit(1)
@@ -26,6 +26,16 @@ def clean_text(text):
     text = re.sub(r'\s+', ' ', text)
     return text.strip()
 
+def generate_title(item_id, track_length_seconds):
+    # 生成标题：例如 "Track i_821534 - 3 min 30 sec"
+    if track_length_seconds is not None:
+        minutes = track_length_seconds // 60
+        seconds = track_length_seconds % 60
+        return f"Track {item_id} - {minutes} min {seconds} sec"
+    else:
+        # 如果没有 track_length_seconds，返回简单的标题
+        return f"Track {item_id}"
+
 def check_path(path):
     os.makedirs(path, exist_ok=True)
 
@@ -42,16 +52,16 @@ def write_remap_index(index_map, file_path):
 # 数据加载适配 (核心修改部分)
 # ==========================================
 
-def load_hf_data(input_path):
+def load_hf_data(dataset_name):
     """
     加载 Hugging Face Dataset，保持 Dataset 对象以支持内存映射。
     避免使用 to_pandas() 以防止大文件 OOM。
     """
-    print(f"Loading Hugging Face dataset from {input_path}...")
+    print(f"Loading Hugging Face dataset from {dataset_name}...")
     
     try:
         # 1. 加载数据（Memory-mapped，不会立即读取到内存）
-        dataset = load_from_disk(input_path)
+        dataset = load_dataset("yandex/yambda", dataset_name)
         
         # 2. 处理 DatasetDict
         if isinstance(dataset, DatasetDict):
@@ -146,19 +156,39 @@ def k_core_filtering(ds, user_k=5, item_k=5):
             print(f"  Iter {iteration}: Dropping {num_items_dropped} items (<{item_k})")
             
             def filter_items_batched(batch):
+                # 处理 metadata
+                res_meta = []
                 new_ids = []
                 new_times = []
+                
+                # 检查是否存在 track_length_seconds 列
+                has_track_len = 'track_length_seconds' in batch
+                
                 for i in range(len(batch['item_ids'])):
                     items = batch['item_ids'][i]
                     times = batch['timestamps'][i]
+                    
+                    # 安全获取时长信息
+                    track_len_seq = batch['track_length_seconds'][i] if has_track_len else None
+                    
                     f_items, f_times = [], []
+                    f_meta_seq = [] # 存储当前序列的 metadata
+                    
                     for j, iid in enumerate(items):
                         if iid in keep_items:
                             f_items.append(iid)
                             f_times.append(times[j])
+                            
+                            # 生成标题
+                            t_len = track_len_seq[j] if track_len_seq is not None else None
+                            title = generate_title(iid, t_len)
+                            f_meta_seq.append({"asin": iid, "title": title})
+                            
                     new_ids.append(f_items)
                     new_times.append(f_times)
-                return {'item_ids': new_ids, 'timestamps': new_times}
+                    res_meta.append(f_meta_seq) # 保持 batch 结构一致 (List of Lists)
+                    
+                return {'item_ids': new_ids, 'timestamps': new_times, 'meta': res_meta}
 
             ds = ds.map(filter_items_batched, batched=True, batch_size=1000, desc=f"Filtering items iter {iteration}", num_proc=30)
             
@@ -181,24 +211,24 @@ def k_core_filtering(ds, user_k=5, item_k=5):
 # Metadata 读取
 # ==========================================
 
-def load_metadata(metadata_file):
-    print(f"Loading metadata from {metadata_file}...")
-    asin2meta = {}
-    valid_asins = set()
-    try:
-        with open(metadata_file, 'r', encoding='utf-8') as f:
-            for line in tqdm(f, desc="Reading metadata"):
-                try:
-                    meta = json.loads(line)
-                    if 'title' in meta and len(str(meta['title']).strip()) > 0:
-                        asin = meta['asin']
-                        asin2meta[asin] = meta
-                        valid_asins.add(asin)
-                except json.JSONDecodeError:
-                    continue
-    except FileNotFoundError:
-        return {}, set()
-    return asin2meta, valid_asins
+# def load_metadata(metadata_file):
+#     print(f"Loading metadata from {metadata_file}...")
+#     asin2meta = {}
+#     valid_asins = set()
+#     try:
+#         with open(metadata_file, 'r', encoding='utf-8') as f:
+#             for line in tqdm(f, desc="Reading metadata"):
+#                 try:
+#                     meta = json.loads(line)
+#                     if 'title' in meta and len(str(meta['title']).strip()) > 0:
+#                         asin = meta['asin']
+#                         asin2meta[asin] = meta
+#                         valid_asins.add(asin)
+#                 except json.JSONDecodeError:
+#                     continue
+#     except FileNotFoundError:
+#         return {}, set()
+#     return asin2meta, valid_asins
 
 def create_item_features(valid_items_set, asin2meta, item2index):
     item2feature = {}
@@ -236,15 +266,15 @@ def create_item_features(valid_items_set, asin2meta, item2index):
 
 def process_data(args):
     # 1. 加载 HF 数据 (修改点)
-    ds = load_hf_data(args.input_path)
+    ds = load_hf_data(args.dataset)
     print(f"Loaded {len(ds)} users.")
 
     # 2. Metadata 过滤 (如果存在)
-    asin2meta = {}
-    valid_metadata_asins = set()
-    if args.metadata_file:
-        asin2meta, valid_metadata_asins = load_metadata(args.metadata_file)
-        ds = filter_items_by_metadata(ds, valid_metadata_asins)
+    # asin2meta = {}
+    # valid_metadata_asins = set()
+    # if args.metadata_file:
+    #     asin2meta, valid_metadata_asins = load_metadata(args.metadata_file)
+    #     ds = filter_items_by_metadata(ds, valid_metadata_asins)
 
     # 3. K-Core
     ds = k_core_filtering(ds, user_k=args.user_k, item_k=args.item_k)
@@ -253,69 +283,97 @@ def process_data(args):
         print("No data left.")
         return
 
-    # 4. 序列生成
-    user2index, item2index = {}, {}
-    interaction_list = []
-    valid_items_set = set()
+    # 4. ID Map 构建
+    print("Building ID maps...")
+    uids = set()
+    items = set()
+    # 使用迭代器快速收集 ID
+    for batch in tqdm(ds.iter(batch_size=10000, columns=['uid', 'item_ids']), total=(len(ds)//10000)+1, desc="Collecting IDs"):
+        uids.update(str(u) for u in batch['uid'])
+        for seq in batch['item_ids']:
+            items.update(seq)
+            
+    user2index = {u: i for i, u in enumerate(sorted(list(uids)))}
+    item2index = {i: idx + 1 for idx, i in enumerate(sorted(list(items)))} # 1-based
     
-    # Dataset 直接迭代，不需要 iterrows
-    for row in tqdm(ds, total=len(ds), desc="Generating sequences"):
-        original_uid = str(row['uid'])
-        original_item_seq = row['item_ids']
-        original_time_seq = row['timestamps']
+    print(f"Total Users: {len(user2index)}, Total Items: {len(item2index)}")
+
+    # 5. 序列生成
+    interaction_list = []
+    global_meta_dict = {} # 使用全局字典收集 metadata
+    
+    # 使用 batch 迭代加速
+    batch_size = 5000
+    for batch in tqdm(ds.iter(batch_size=batch_size), total=(len(ds)//batch_size)+1, desc="Generating sequences"):
+        b_uids = batch['uid']
+        b_item_seqs = batch['item_ids']
+        b_time_seqs = batch['timestamps']
+
+        # 正确收集 Metadata (处理嵌套结构)
+        if 'meta' in batch:
+            for seq_meta in batch['meta']:
+                for m in seq_meta:
+                    if m['asin'] not in global_meta_dict:
+                        # 转换为 create_item_features 需要的格式
+                        global_meta_dict[m['asin']] = {
+                            "title": m['title'],
+                            "description": "",
+                            "brand": "",
+                            "categories": []
+                        }
         
-        if original_uid not in user2index:
-            user2index[original_uid] = len(user2index)
+        for i in range(len(b_uids)):
+            original_uid = str(b_uids[i])
+            original_item_seq = b_item_seqs[i]
+            original_time_seq = b_time_seqs[i]
             
-        item_ids_remapped = []
-        for iid in original_item_seq:
-            if iid not in item2index:
-                item2index[iid] = len(item2index) + 1
-            item_ids_remapped.append(item2index[iid])
-            valid_items_set.add(iid)
+            if original_uid not in user2index:
+                continue
+                
+            u_idx = user2index[original_uid]
             
-        if len(item_ids_remapped) < 2:
-            continue
+            item_ids_remapped = []
+            seq_times = []
+            for k, iid in enumerate(original_item_seq):
+                if iid in item2index:
+                    item_ids_remapped.append(item2index[iid])
+                    seq_times.append(original_time_seq[k])
             
-        for i in range(1, len(item_ids_remapped)):
-            st = max(i - 50, 0)
-            interaction_list.append({
-                'user_idx': user2index[original_uid],
-                'history_seq': item_ids_remapped[st:i],
-                'target_item': item_ids_remapped[i],
-                'timestamp': original_time_seq[i]
-            })
+            if len(item_ids_remapped) < 2:
+                continue
+                
+            for k in range(1, len(item_ids_remapped)):
+                st = max(k - 50, 0)
+                interaction_list.append({
+                    'user_idx': u_idx,
+                    'history_seq': item_ids_remapped[st:k],
+                    'target_item': item_ids_remapped[k],
+                    'timestamp': seq_times[k]
+                })
 
     interaction_list.sort(key=lambda x: x['timestamp'])
     
-    # 5. 写入 Inter 文件
+    # 6. 写入 Inter 文件
     print(f"Writing interaction files ({len(interaction_list)} samples)...")
     check_path(os.path.join(args.output_path, args.dataset))
     
-    total_len = len(interaction_list)
-    split_1, split_2 = int(total_len * 0.8), int(total_len * 0.9)
+    # 依然只生成一个 valid 文件
+    file_path = os.path.join(args.output_path, args.dataset, f'{args.dataset}.valid.inter')
     
-    datasets = {
-        # 'train': interaction_list[:split_1],
-        # 'valid': interaction_list[split_1:split_2],
-        'valid': interaction_list[:]
-        # 'test': interaction_list[split_2:]
-    }
-    
-    for dtype, data in datasets.items():
-        file_path = os.path.join(args.output_path, args.dataset, f'{args.dataset}.{dtype}.inter')
-        with open(file_path, 'w') as f:
-            f.write('user_id:token\titem_id_list:token_seq\titem_id:token\n')
-            for s in data:
-                seq_str = " ".join(map(str, s['history_seq']))
-                f.write(f"{s['user_idx']}\t{seq_str}\t{s['target_item']}\n")
+    with open(file_path, 'w') as f:
+        f.write('user_id:token\titem_id_list:token_seq\titem_id:token\n')
+        for s in interaction_list:
+            seq_str = " ".join(map(str, s['history_seq']))
+            f.write(f"{s['user_idx']}\t{seq_str}\t{s['target_item']}\n")
 
-    # 6. Metadata Output
-    if args.metadata_file and asin2meta:
-        item_features = create_item_features(valid_items_set, asin2meta, item2index)
+    # 7. Metadata Output
+    final_meta = global_meta_dict
+    if final_meta:
+        # item2index 的 keys 就是所有有效 items
+        item_features = create_item_features(item2index.keys(), final_meta, item2index)
         write_json_file(item_features, os.path.join(args.output_path, args.dataset, f'{args.dataset}.item.json'))
 
-    # 7. ID Maps
+    # 8. ID Maps
     write_remap_index(user2index, os.path.join(args.output_path, args.dataset, f'{args.dataset}.user2id'))
     write_remap_index(item2index, os.path.join(args.output_path, args.dataset, f'{args.dataset}.item2id'))
 
@@ -323,11 +381,11 @@ def process_data(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--dataset', type=str, default='DatasetName')
+    parser.add_argument('--dataset', type=str, default='sequential-multievent-50m')
     # 这里输入应该是包含 DatasetDict 的文件夹路径
-    parser.add_argument('--input_path', type=str, required=True, help='Path to HF Dataset folder')
+    # parser.add_argument('--input_path', type=str, required=True, help='Path to HF Dataset folder')
     parser.add_argument('--metadata_file', type=str, default=None)
-    parser.add_argument('--output_path', type=str, default='./data')
+    parser.add_argument('--output_path', type=str, default='./yambda')
     parser.add_argument('--user_k', type=int, default=5)
     parser.add_argument('--item_k', type=int, default=5)
     args = parser.parse_args()
