@@ -247,6 +247,11 @@ def k_core_filtering(ds, user_k=5, item_k=5):
         print(f"  Iter {iteration}: Total samples (interactions): {total_interactions}")
         
         if num_items_dropped == 0 and num_users_dropped == 0:
+            if total_interactions > 2000000:
+                user_k += 1
+                item_k += 1
+                print(f"  Data count {total_interactions} > 2M. Increasing user_k={user_k}, item_k={item_k}")
+                continue
             print("K-core converged.")
             break
         if len(ds) == 0:
