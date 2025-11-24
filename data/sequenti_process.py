@@ -5,7 +5,27 @@ import html
 import re
 import pandas as pd
 import collections
+import multiprocessing
 from tqdm import tqdm
+
+def _count_items_shard(ds_shard):
+    """
+    辅助函数：统计分片中的 Item 频率
+    """
+    cnt = collections.defaultdict(int)
+    
+    # 仅读取 item_ids 列，减少 IO
+    # 注意：Dataset.iter() 不支持 columns 参数，需先 select_columns
+    target_ds = ds_shard
+    if hasattr(ds_shard, "select_columns"):
+        target_ds = ds_shard.select_columns(["item_ids"])
+        
+    for batch in target_ds.iter(batch_size=1000):
+        for seq in batch['item_ids']:
+            for iid in seq:
+                cnt[iid] += 1
+    return cnt
+
 # 新增：引入 datasets 库
 try:
     from datasets import load_from_disk, load_dataset, Dataset, DatasetDict
@@ -52,7 +72,7 @@ def write_remap_index(index_map, file_path):
 # 数据加载适配 (核心修改部分)
 # ==========================================
 
-def load_hf_data(dataset_name):
+def load_hf_data(dataset_name, max_samples=None):
     """
     加载 Hugging Face Dataset，保持 Dataset 对象以支持内存映射。
     避免使用 to_pandas() 以防止大文件 OOM。
@@ -85,6 +105,10 @@ def load_hf_data(dataset_name):
         if 'timestamp' in current_cols:
             print("Renaming timestamp -> timestamps")
             ds = ds.rename_column('timestamp', 'timestamps')
+
+        if max_samples is not None:
+            print(f"DEBUG: selecting first {max_samples} samples for testing...")
+            ds = ds.select(range(min(len(ds), max_samples)))
             
         return ds
         
@@ -97,43 +121,46 @@ def load_hf_data(dataset_name):
 # K-Core 过滤逻辑
 # ==========================================
 
-def filter_items_by_metadata(ds, valid_asins):
-    if not valid_asins:
-        return ds
-    print(f"Filtering items based on metadata ({len(valid_asins)} valid ASINs)...")
+# def filter_items_by_metadata(ds, valid_asins):
+#     if not valid_asins:
+#         return ds
+#     print(f"Filtering items based on metadata ({len(valid_asins)} valid ASINs)...")
     
-    valid_set = set(str(x) for x in valid_asins)
+#     valid_set = set(str(x) for x in valid_asins)
     
-    def filter_row_batch(batch):
-        new_item_ids = []
-        new_timestamps = []
+#     def filter_row_batch(batch):
+#         new_item_ids = []
+#         new_timestamps = []
         
-        for i in range(len(batch['item_ids'])):
-            items = batch['item_ids'][i]
-            times = batch['timestamps'][i]
+#         for i in range(len(batch['item_ids'])):
+#             items = batch['item_ids'][i]
+#             times = batch['timestamps'][i]
             
-            f_items = []
-            f_times = []
-            for k, item in enumerate(items):
-                if str(item) in valid_set:
-                    f_items.append(item)
-                    f_times.append(times[k])
+#             f_items = []
+#             f_times = []
+#             for k, item in enumerate(items):
+#                 if str(item) in valid_set:
+#                     f_items.append(item)
+#                     f_times.append(times[k])
             
-            new_item_ids.append(f_items)
-            new_timestamps.append(f_times)
+#             new_item_ids.append(f_items)
+#             new_timestamps.append(f_times)
             
-        return {'item_ids': new_item_ids, 'timestamps': new_timestamps}
+#         return {'item_ids': new_item_ids, 'timestamps': new_timestamps}
 
-    # 使用 map 进行并行处理
-    ds = ds.map(filter_row_batch, batched=True, desc="Metadata filtering", num_proc=4)
+#     # 使用 map 进行并行处理
+#     ds = ds.map(filter_row_batch, batched=True, desc="Metadata filtering", num_proc=4)
     
-    # 过滤空序列
-    ds = ds.filter(lambda x: len(x['item_ids']) > 0, desc="Dropping empty seqs")
-    return ds
+#     # 过滤空序列
+#     ds = ds.filter(lambda x: len(x['item_ids']) > 0, desc="Dropping empty seqs")
+#     return ds
 
 def k_core_filtering(ds, user_k=5, item_k=5):
     print(f"\nStarting K-core filtering (User K={user_k}, Item K={item_k})...")
     print(f"Initial state: {len(ds)} users")
+    
+    # 并行进程数
+    num_proc = 30
     
     iteration = 0
     while True:
@@ -141,12 +168,24 @@ def k_core_filtering(ds, user_k=5, item_k=5):
         prev_users_count = len(ds)
         
         # Step 1: 统计 Item 频率
-        item_counts = collections.defaultdict(int)
-        # 使用迭代器流式读取，避免一次性加载所有 item_ids 到内存
-        for batch in tqdm(ds.iter(batch_size=10000), desc=f"Counting items iter {iteration}", leave=False):
-            for seq in batch['item_ids']:
-                for iid in seq:
-                    item_counts[iid] += 1
+        # 优化：根据数据量决定是否使用多进程统计
+        if len(ds) < 5000:
+            item_counts = collections.defaultdict(int)
+            for batch in tqdm(ds.iter(batch_size=1000), desc=f"Counting items iter {iteration}", leave=False):
+                for seq in batch['item_ids']:
+                    for iid in seq:
+                        item_counts[iid] += 1
+        else:
+            print(f"  Iter {iteration}: Counting items (parallel, {num_proc} procs)...")
+            shards = [ds.shard(num_shards=num_proc, index=i, contiguous=True) for i in range(num_proc)]
+            
+            with multiprocessing.Pool(num_proc) as pool:
+                results = pool.map(_count_items_shard, shards)
+            
+            item_counts = collections.defaultdict(int)
+            for res in results:
+                for k, v in res.items():
+                    item_counts[k] += v
                 
         keep_items = {iid for iid, count in item_counts.items() if count >= item_k}
         num_items_dropped = len(item_counts) - len(keep_items)
@@ -190,14 +229,22 @@ def k_core_filtering(ds, user_k=5, item_k=5):
                     
                 return {'item_ids': new_ids, 'timestamps': new_times, 'meta': res_meta}
 
-            ds = ds.map(filter_items_batched, batched=True, batch_size=1000, desc=f"Filtering items iter {iteration}", num_proc=30)
+            ds = ds.map(filter_items_batched, batched=True, batch_size=1000, desc=f"Filtering items iter {iteration}", num_proc=num_proc)
             
         # Step 3: 过滤 Users
-        ds_filtered = ds.filter(lambda x: len(x['item_ids']) >= user_k, desc=f"Filtering users iter {iteration}")
+        # 优化：启用多进程 filter
+        ds_filtered = ds.filter(lambda x: len(x['item_ids']) >= user_k, desc=f"Filtering users iter {iteration}", num_proc=num_proc)
         num_users_dropped = prev_users_count - len(ds_filtered)
         print(f"  Iter {iteration}: Dropping {num_users_dropped} users (<{user_k})")
         
         ds = ds_filtered
+        
+        # Calculate total samples (interactions)
+        total_interactions = 0
+        for batch in ds.iter(batch_size=10000):
+            for seq in batch['item_ids']:
+                total_interactions += len(seq)
+        print(f"  Iter {iteration}: Total samples (interactions): {total_interactions}")
         
         if num_items_dropped == 0 and num_users_dropped == 0:
             print("K-core converged.")
@@ -234,9 +281,8 @@ def create_item_features(valid_items_set, asin2meta, item2index):
     item2feature = {}
     print("Generating item features...")
     for original_item_id in tqdm(valid_items_set, desc="Processing features"):
-        original_id_str = str(original_item_id)
-        if original_id_str in asin2meta:
-            meta = asin2meta[original_id_str]
+        if original_item_id in asin2meta:
+            meta = asin2meta[original_item_id]
             new_id = item2index[original_item_id]
             
             title = clean_text(meta.get("title", ""))
@@ -261,12 +307,98 @@ def create_item_features(valid_items_set, asin2meta, item2index):
     return item2feature
 
 # ==========================================
+# 并行处理辅助函数
+# ==========================================
+
+# 全局变量用于多进程共享 (避免 pickle 开销)
+_shared_ds = None
+_shared_u2i = None
+_shared_i2i = None
+
+def process_shard_sequences(args):
+    """
+    处理单个 shard 的序列生成
+    """
+    shard_idx, num_shards, batch_size = args
+    
+    # 子进程直接访问 copy-on-write 的全局变量
+    # 注意：ds.shard 是 lazy 的，开销很小
+    ds_shard = _shared_ds.shard(num_shards=num_shards, index=shard_idx, contiguous=True)
+    
+    local_interactions = []
+    local_meta = {}
+    
+    # 显式选择列以减少 IO
+    cols = ['uid', 'item_ids', 'timestamps']
+    if 'meta' in ds_shard.column_names:
+        cols.append('meta')
+        
+    target_ds = ds_shard
+    if hasattr(ds_shard, "select_columns"):
+        target_ds = ds_shard.select_columns(cols)
+    
+    for batch in target_ds.iter(batch_size=batch_size):
+        b_uids = batch['uid']
+        b_item_seqs = batch['item_ids']
+        b_time_seqs = batch['timestamps']
+        
+        # 1. 收集 Metadata
+        if 'meta' in batch:
+            for seq_meta in batch['meta']:
+                for m in seq_meta:
+                    if m['asin'] not in local_meta:
+                        local_meta[m['asin']] = {
+                            "title": m['title'],
+                            "description": "",
+                            "brand": "",
+                            "categories": []
+                        }
+        
+        # 2. 生成交互序列
+        for i in range(len(b_uids)):
+            original_uid = str(b_uids[i])
+            if original_uid not in _shared_u2i:
+                continue
+                
+            u_idx = _shared_u2i[original_uid]
+            
+            original_item_seq = b_item_seqs[i]
+            original_time_seq = b_time_seqs[i]
+            
+            item_ids_remapped = []
+            seq_times = []
+            
+            for k, iid in enumerate(original_item_seq):
+                if iid in _shared_i2i:
+                    item_ids_remapped.append(_shared_i2i[iid])
+                    seq_times.append(original_time_seq[k])
+            
+            if len(item_ids_remapped) < 2:
+                continue
+                
+            seq_len = len(item_ids_remapped)
+            for k in range(1, seq_len):
+                st = max(k - 50, 0)
+                history = item_ids_remapped[st:k]
+                target = item_ids_remapped[k]
+                ts = seq_times[k]
+                
+                local_interactions.append({
+                    'user_idx': u_idx,
+                    'history_seq': history,
+                    'target_item': target,
+                    'timestamp': ts
+                })
+            
+    return local_interactions, local_meta
+
+# ==========================================
 # Main
 # ==========================================
 
 def process_data(args):
     # 1. 加载 HF 数据 (修改点)
-    ds = load_hf_data(args.dataset)
+    ds = load_hf_data(args.dataset, args.debug_size)
     print(f"Loaded {len(ds)} users.")
 
     # 2. Metadata 过滤 (如果存在)
@@ -287,8 +419,14 @@ def process_data(args):
     print("Building ID maps...")
     uids = set()
     items = set()
+    
+    # 优化：仅读取需要的列
+    target_ds = ds
+    if hasattr(ds, "select_columns"):
+        target_ds = ds.select_columns(['uid', 'item_ids'])
+
     # 使用迭代器快速收集 ID
-    for batch in tqdm(ds.iter(batch_size=10000, columns=['uid', 'item_ids']), total=(len(ds)//10000)+1, desc="Collecting IDs"):
+    for batch in tqdm(target_ds.iter(batch_size=10000), total=(len(ds)//10000)+1, desc="Collecting IDs"):
         uids.update(str(u) for u in batch['uid'])
         for seq in batch['item_ids']:
             items.update(seq)
@@ -298,59 +436,37 @@ def process_data(args):
     
     print(f"Total Users: {len(user2index)}, Total Items: {len(item2index)}")
 
-    # 5. 序列生成
+    # 5. 序列生成 (多进程并行优化)
     interaction_list = []
-    global_meta_dict = {} # 使用全局字典收集 metadata
+    global_meta_dict = {} 
     
-    # 使用 batch 迭代加速
-    batch_size = 5000
-    for batch in tqdm(ds.iter(batch_size=batch_size), total=(len(ds)//batch_size)+1, desc="Generating sequences"):
-        b_uids = batch['uid']
-        b_item_seqs = batch['item_ids']
-        b_time_seqs = batch['timestamps']
+    # 设置全局变量，供子进程使用
+    global _shared_ds, _shared_u2i, _shared_i2i
+    _shared_ds = ds
+    _shared_u2i = user2index
+    _shared_i2i = item2index
+    
+    batch_size = 2000 
+    num_proc = 30 # 进程数
+    
+    print(f"Generating sequences (Parallel, {num_proc} procs)...")
+    
+    # 只需要传递分片索引，不需要传递数据
+    tasks = [(i, num_proc, batch_size) for i in range(num_proc)]
+    
+    with multiprocessing.Pool(num_proc) as pool:
+        # 使用 imap_unordered 获取结果
+        for local_inters, local_meta in tqdm(pool.imap_unordered(process_shard_sequences, tasks), 
+                                             total=num_proc, desc="Processing shards"):
+            interaction_list.extend(local_inters)
+            global_meta_dict.update(local_meta)
+            
+    # 清理全局变量
+    _shared_ds = None
+    _shared_u2i = None
+    _shared_i2i = None
 
-        # 正确收集 Metadata (处理嵌套结构)
-        if 'meta' in batch:
-            for seq_meta in batch['meta']:
-                for m in seq_meta:
-                    if m['asin'] not in global_meta_dict:
-                        # 转换为 create_item_features 需要的格式
-                        global_meta_dict[m['asin']] = {
-                            "title": m['title'],
-                            "description": "",
-                            "brand": "",
-                            "categories": []
-                        }
-        
-        for i in range(len(b_uids)):
-            original_uid = str(b_uids[i])
-            original_item_seq = b_item_seqs[i]
-            original_time_seq = b_time_seqs[i]
-            
-            if original_uid not in user2index:
-                continue
-                
-            u_idx = user2index[original_uid]
-            
-            item_ids_remapped = []
-            seq_times = []
-            for k, iid in enumerate(original_item_seq):
-                if iid in item2index:
-                    item_ids_remapped.append(item2index[iid])
-                    seq_times.append(original_time_seq[k])
-            
-            if len(item_ids_remapped) < 2:
-                continue
-                
-            for k in range(1, len(item_ids_remapped)):
-                st = max(k - 50, 0)
-                interaction_list.append({
-                    'user_idx': u_idx,
-                    'history_seq': item_ids_remapped[st:k],
-                    'target_item': item_ids_remapped[k],
-                    'timestamp': seq_times[k]
-                })
-
+    print("Sorting interactions by timestamp...")
     interaction_list.sort(key=lambda x: x['timestamp'])
     
     # 6. 写入 Inter 文件
@@ -381,12 +497,13 @@ def process_data(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--dataset', type=str, default='sequential-multievent-50m')
+    parser.add_argument('--dataset', type=str, default='sequential-multievent-5b')
     # 这里输入应该是包含 DatasetDict 的文件夹路径
     # parser.add_argument('--input_path', type=str, required=True, help='Path to HF Dataset folder')
     parser.add_argument('--metadata_file', type=str, default=None)
     parser.add_argument('--output_path', type=str, default='./yambda')
-    parser.add_argument('--user_k', type=int, default=5)
-    parser.add_argument('--item_k', type=int, default=5)
+    parser.add_argument('--user_k', type=int, default=8)
+    parser.add_argument('--item_k', type=int, default=8)
+    parser.add_argument('--debug_size', type=int, default=None, help='Use only N samples for testing')
     args = parser.parse_args()
     process_data(args)
