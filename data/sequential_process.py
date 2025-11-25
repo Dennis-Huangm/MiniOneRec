@@ -8,6 +8,7 @@ import collections
 import multiprocessing
 from tqdm import tqdm
 import numpy as np
+import gc
 
 def _count_items_shard(ds_shard):
     """
@@ -496,12 +497,17 @@ def process_data(args):
             # s is (u_idx, seq_str, target, ts)
             f.write(f"{s[0]}\t{s[1]}\t{s[2]}\n")
 
+    del interaction_list
+    gc.collect()
     # 7. Metadata Output
     final_meta = global_meta_dict
     if final_meta:
         # item2index 的 keys 就是所有有效 items
         item_features = create_item_features(item2index.keys(), final_meta, item2index)
         write_json_file(item_features, os.path.join(args.output_path, args.dataset, f'{args.dataset}.item.json'))
+    
+    del final_meta
+    gc.collect()
 
     # 8. ID Maps
     write_remap_index(user2index, os.path.join(args.output_path, args.dataset, f'{args.dataset}.user2id'))
