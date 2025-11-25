@@ -7,6 +7,7 @@ import pandas as pd
 import collections
 import multiprocessing
 from tqdm import tqdm
+import numpy as np
 
 def _count_items_shard(ds_shard):
     """
@@ -72,7 +73,7 @@ def write_remap_index(index_map, file_path):
 # 数据加载适配 (核心修改部分)
 # ==========================================
 
-def load_hf_data(dataset_name, max_samples=None):
+def load_hf_data(dataset_name, input_path, max_samples=None):
     """
     加载 Hugging Face Dataset，保持 Dataset 对象以支持内存映射。
     避免使用 to_pandas() 以防止大文件 OOM。
@@ -81,7 +82,7 @@ def load_hf_data(dataset_name, max_samples=None):
     
     try:
         # 1. 加载数据（Memory-mapped，不会立即读取到内存）
-        dataset = load_dataset("yandex/yambda", dataset_name)
+        dataset = load_dataset('parquet', data_dir=input_path)
         
         # 2. 处理 DatasetDict
         if isinstance(dataset, DatasetDict):
@@ -159,6 +160,18 @@ def k_core_filtering(ds, user_k=5, item_k=5):
     print(f"\nStarting K-core filtering (User K={user_k}, Item K={item_k})...")
     print(f"Initial state: {len(ds)} users")
     
+    # Valid items filtering setup
+    valid_items_set = None
+    if os.path.exists('valid_items.json'):
+        print("Loading valid_items.json for filtering...")
+        try:
+            with open('valid_items.json', 'r') as f:
+                valid_items_set = set(json.load(f))
+            print(f"Loaded {len(valid_items_set)} valid items.")
+        except Exception as e:
+            print(f"Error loading valid_items.json: {e}")
+
+    
     # 并行进程数
     num_proc = 30
     
@@ -169,25 +182,28 @@ def k_core_filtering(ds, user_k=5, item_k=5):
         
         # Step 1: 统计 Item 频率
         # 优化：根据数据量决定是否使用多进程统计
-        if len(ds) < 5000:
-            item_counts = collections.defaultdict(int)
-            for batch in tqdm(ds.iter(batch_size=1000), desc=f"Counting items iter {iteration}", leave=False):
-                for seq in batch['item_ids']:
-                    for iid in seq:
-                        item_counts[iid] += 1
-        else:
-            print(f"  Iter {iteration}: Counting items (parallel, {num_proc} procs)...")
-            shards = [ds.shard(num_shards=num_proc, index=i, contiguous=True) for i in range(num_proc)]
-            
-            with multiprocessing.Pool(num_proc) as pool:
-                results = pool.map(_count_items_shard, shards)
-            
-            item_counts = collections.defaultdict(int)
-            for res in results:
-                for k, v in res.items():
-                    item_counts[k] += v
+        # if len(ds) < 5000:
+        #     item_counts = collections.defaultdict(int)
+        #     for batch in tqdm(ds.iter(batch_size=1000), desc=f"Counting items iter {iteration}", leave=False):
+        #         for seq in batch['item_ids']:
+        #             for iid in seq:
+        #                 item_counts[iid] += 1
+        # else:
+        print(f"  Iter {iteration}: Counting items (parallel, {num_proc} procs)...")
+        shards = [ds.shard(num_shards=num_proc, index=i, contiguous=True) for i in range(num_proc)]
+        
+        with multiprocessing.Pool(num_proc) as pool:
+            results = pool.map(_count_items_shard, shards)
+        
+        item_counts = collections.defaultdict(int)
+        for res in results:
+            for k, v in res.items():
+                item_counts[k] += v
                 
-        keep_items = {iid for iid, count in item_counts.items() if count >= item_k}
+        if valid_items_set is not None and iteration == 1:
+            keep_items = {iid for iid, count in item_counts.items() if count >= item_k and iid in valid_items_set}
+        else:
+            keep_items = {iid for iid, count in item_counts.items() if count >= item_k}
         num_items_dropped = len(item_counts) - len(keep_items)
         
         # Step 2: 过滤 Items
@@ -236,21 +252,13 @@ def k_core_filtering(ds, user_k=5, item_k=5):
         ds_filtered = ds.filter(lambda x: len(x['item_ids']) >= user_k, desc=f"Filtering users iter {iteration}", num_proc=num_proc)
         num_users_dropped = prev_users_count - len(ds_filtered)
         print(f"  Iter {iteration}: Dropping {num_users_dropped} users (<{user_k})")
-        
         ds = ds_filtered
         
-        # Calculate total samples (interactions)
-        total_interactions = 0
-        for batch in ds.iter(batch_size=10000):
-            for seq in batch['item_ids']:
-                total_interactions += len(seq)
-        print(f"  Iter {iteration}: Total samples (interactions): {total_interactions}")
-        
         if num_items_dropped == 0 and num_users_dropped == 0:
-            if total_interactions > 2000000:
+            if len(keep_items) > 2000000:
                 user_k += 1
                 item_k += 1
-                print(f"  Data count {total_interactions} > 2M. Increasing user_k={user_k}, item_k={item_k}")
+                print(f"  Data count {keep_items} > 2M. Increasing user_k={user_k}, item_k={item_k}")
                 continue
             print("K-core converged.")
             break
@@ -403,7 +411,7 @@ def process_shard_sequences(args):
 
 def process_data(args):
     # 1. 加载 HF 数据 (修改点)
-    ds = load_hf_data(args.dataset, args.debug_size)
+    ds = load_hf_data(args.dataset, args.input_path, args.debug_size)
     print(f"Loaded {len(ds)} users.")
 
     # 2. Metadata 过滤 (如果存在)
@@ -437,7 +445,7 @@ def process_data(args):
             items.update(seq)
             
     user2index = {u: i for i, u in enumerate(sorted(list(uids)))}
-    item2index = {i: idx + 1 for idx, i in enumerate(sorted(list(items)))} # 1-based
+    item2index = {i: idx for idx, i in enumerate(sorted(list(items)))} 
     
     print(f"Total Users: {len(user2index)}, Total Items: {len(item2index)}")
 
@@ -498,17 +506,79 @@ def process_data(args):
     write_remap_index(user2index, os.path.join(args.output_path, args.dataset, f'{args.dataset}.user2id'))
     write_remap_index(item2index, os.path.join(args.output_path, args.dataset, f'{args.dataset}.item2id'))
 
+    # 9. Embeddings Extraction
+    emb_path = args.emb_path
+    if os.path.exists(emb_path):
+        print(f"Extracting embeddings from {emb_path}...")
+        try:
+            # Load embeddings dataset
+            emb_ds = load_dataset('parquet', data_files=emb_path, split='train')
+            
+            # Determine embedding dimension
+            sample_emb = emb_ds[0]['embed']
+            emb_dim = len(sample_emb)
+            print(f"Embedding dimension: {emb_dim}")
+            
+            # Initialize matrix with zeros
+            num_items = len(item2index)
+            emb_matrix = np.zeros((num_items, emb_dim), dtype=np.float16)
+            print("Scanning parquet item_ids...")
+            parquet_ids = emb_ds['item_id']
+            
+            # Create a set of valid original IDs for fast lookup
+            valid_original_ids = set(item2index.keys())
+            
+            # Iterate over the embeddings dataset and fill the matrix
+            # Note: This assumes item_id in parquet matches keys in item2index
+            count_found = 0
+            
+            relevant_indices = []
+            
+            # Iterate through all parquet IDs to find matches
+            for i, iid in enumerate(tqdm(parquet_ids, desc="Indexing IDs")):
+                if iid in valid_original_ids:
+                    relevant_indices.append(i)
+            
+            print(f"Selected {len(relevant_indices)} rows from parquet.")
+            
+            # Fetch only relevant rows using the indices
+            if relevant_indices:
+                subset = emb_ds.select(relevant_indices)
+                
+                count_found = 0
+                for row in tqdm(subset, desc="Extracting embeddings"):
+                    iid = row['item_id']
+                    if iid in item2index:
+                        idx = item2index[iid]
+                        emb = row['embed']
+                        if len(emb) == emb_dim:
+                             emb_matrix[idx] = np.array(emb, dtype=np.float16)
+                             count_found += 1
+            
+            print(f"Found embeddings for {count_found}/{num_items} items.")
+            
+            # Save as .npy
+            npy_path = os.path.join(args.output_path, args.dataset, f'{args.dataset}.item_emb.npy')
+            np.save(npy_path, emb_matrix)
+            print(f"Saved embedding matrix to {npy_path}")
+            
+        except Exception as e:
+            print(f"Error processing embeddings: {e}")
+    else:
+        print(f"Embeddings file not found at {emb_path}")
+
     print("Done.")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--dataset', type=str, default='sequential-multievent-5b')
+    parser.add_argument('--dataset', type=str, default='sequential-multievent-500m')
     # 这里输入应该是包含 DatasetDict 的文件夹路径
-    # parser.add_argument('--input_path', type=str, required=True, help='Path to HF Dataset folder')
+    parser.add_argument('--input_path', type=str, default='/home/huangminrui/datasets/yambda/sequential/500m/sharded_polars/', help='Path to HF Dataset folder')
     parser.add_argument('--metadata_file', type=str, default=None)
     parser.add_argument('--output_path', type=str, default='./yambda')
-    parser.add_argument('--user_k', type=int, default=8)
-    parser.add_argument('--item_k', type=int, default=8)
+    parser.add_argument('--user_k', type=int, default=5)
+    parser.add_argument('--item_k', type=int, default=5)
     parser.add_argument('--debug_size', type=int, default=None, help='Use only N samples for testing')
+    parser.add_argument('--emb_path', type=str, default='/home/huangminrui/datasets/yambda/embeddings.parquet')
     args = parser.parse_args()
     process_data(args)
