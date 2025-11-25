@@ -391,17 +391,16 @@ def process_shard_sequences(args):
                 
             seq_len = len(item_ids_remapped)
             for k in range(1, seq_len):
-                st = max(k - 50, 0)
+                st = max(k - 10, 0)
                 history = item_ids_remapped[st:k]
                 target = item_ids_remapped[k]
                 ts = seq_times[k]
                 
-                local_interactions.append({
-                    'user_idx': u_idx,
-                    'history_seq': history,
-                    'target_item': target,
-                    'timestamp': ts
-                })
+                # 优化：转换为 Tuple 和 预处理 String 以减少内存占用
+                # history_seq 转为字符串存储，避免 list overhead
+                seq_str = " ".join(map(str, history))
+                
+                local_interactions.append((u_idx, seq_str, target, ts))
             
     return local_interactions, local_meta
 
@@ -460,17 +459,18 @@ def process_data(args):
     _shared_i2i = item2index
     
     batch_size = 2000 
-    num_proc = 30 # 进程数
+    num_workers = 10   # 降低并发数，避免峰值内存过高
+    num_shards = 200   # 增加分片数，减少每个子进程持有的数据量
     
-    print(f"Generating sequences (Parallel, {num_proc} procs)...")
+    print(f"Generating sequences (Parallel, {num_workers} workers, {num_shards} shards)...")
     
     # 只需要传递分片索引，不需要传递数据
-    tasks = [(i, num_proc, batch_size) for i in range(num_proc)]
+    tasks = [(i, num_shards, batch_size) for i in range(num_shards)]
     
-    with multiprocessing.Pool(num_proc) as pool:
+    with multiprocessing.Pool(num_workers) as pool:
         # 使用 imap_unordered 获取结果
         for local_inters, local_meta in tqdm(pool.imap_unordered(process_shard_sequences, tasks), 
-                                             total=num_proc, desc="Processing shards"):
+                                             total=num_shards, desc="Processing shards"):
             interaction_list.extend(local_inters)
             global_meta_dict.update(local_meta)
             
@@ -480,7 +480,8 @@ def process_data(args):
     _shared_i2i = None
 
     print("Sorting interactions by timestamp...")
-    interaction_list.sort(key=lambda x: x['timestamp'])
+    # Tuple 格式：(u_idx, seq_str, target, ts) -> 按 ts 排序 (index 3)
+    interaction_list.sort(key=lambda x: x[3])
     
     # 6. 写入 Inter 文件
     print(f"Writing interaction files ({len(interaction_list)} samples)...")
@@ -492,8 +493,8 @@ def process_data(args):
     with open(file_path, 'w') as f:
         f.write('user_id:token\titem_id_list:token_seq\titem_id:token\n')
         for s in interaction_list:
-            seq_str = " ".join(map(str, s['history_seq']))
-            f.write(f"{s['user_idx']}\t{seq_str}\t{s['target_item']}\n")
+            # s is (u_idx, seq_str, target, ts)
+            f.write(f"{s[0]}\t{s[1]}\t{s[2]}\n")
 
     # 7. Metadata Output
     final_meta = global_meta_dict
