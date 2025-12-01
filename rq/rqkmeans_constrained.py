@@ -13,46 +13,90 @@ import time
 import argparse
 import json
 from collections import defaultdict
+from tqdm import tqdm
 
 try:
     from k_means_constrained import KMeansConstrained
     HAS_CONSTRAINED = True
 except ImportError:
     HAS_CONSTRAINED = False
-    print("Warning: k-means-constrained not available")
-    print("Install with: pip install k-means-constrained")
+    # print("Warning: k-means-constrained not available")
+
+try:
+    from sklearn.cluster import MiniBatchKMeans
+    HAS_SKLEARN = True
+except ImportError:
+    HAS_SKLEARN = False
 
 
 def balanced_kmeans_level_constrained(X, K, max_iter=100, tol=1e-7, random_state=None, verbose=False):
-    """Balanced K-means implemented with k-means-constrained"""
+    """Balanced K-means implemented with k-means-constrained or fallback to MiniBatchKMeans"""
     start_time = time.time()
     n, d = X.shape
     X = X.astype(np.float32, copy=False)
 
-    # Calculate min and max cluster size
-    min_size = max(1, n // K - 1)  # allow some imbalance
-    max_size = n // K + 1
+    # Threshold for switching to fast approximation
+    # k-means-constrained is O(N^2) or worse, so it's very slow for N > 20k
+    LARGE_DATA_THRESHOLD = 20000
 
-    if verbose:
-        print(f"    Starting constrained K-means with K={K}, n={n}, d={d}")
-        print(f"    Cluster size constraints: [{min_size}, {max_size}]")
+    use_fast = False
+    if n > LARGE_DATA_THRESHOLD:
+        if HAS_SKLEARN:
+            use_fast = True
+            if verbose:
+                print(f"    [Notice] Data size {n} > {LARGE_DATA_THRESHOLD}. Switching to MiniBatchKMeans for speed.")
+                print("    (Strict balanced constraint is relaxed to approximate balance)")
+        else:
+            print(f"    [Warning] Data size {n} is large but sklearn is not installed. Training will be very slow.")
 
-    # Use k-means-constrained
-    kmeans = KMeansConstrained(
-        n_clusters=K,
-        size_min=min_size,
-        size_max=max_size,
-        max_iter=max_iter,
-        tol=tol,
-        random_state=random_state,
-        n_init=3,
-        verbose=verbose,
-        n_jobs=16
-    )
+    if use_fast:
+        # Use MiniBatchKMeans for large datasets
+        # Increase batch size for better quality on large data
+        batch_size = min(n, 4096 * 4)
+        kmeans = MiniBatchKMeans(
+            n_clusters=K,
+            max_iter=max_iter,
+            tol=tol,
+            random_state=random_state,
+            batch_size=batch_size,
+            n_init=3,
+            verbose=0
+        )
+        labels = kmeans.fit_predict(X)
+        centroids = kmeans.cluster_centers_
+        
+        if verbose:
+            print(f"    Using MiniBatchKMeans with batch_size={batch_size}")
 
-    # Train and get labels
-    labels = kmeans.fit_predict(X)
-    centroids = kmeans.cluster_centers_
+    else:
+        # Use k-means-constrained for smaller datasets
+        if not HAS_CONSTRAINED:
+            raise ImportError("k-means-constrained not installed and dataset is small enough to use it.")
+            
+        # Calculate min and max cluster size
+        min_size = max(1, n // K - 1)  # allow some imbalance
+        max_size = n // K + 1
+    
+        if verbose:
+            print(f"    Starting constrained K-means with K={K}, n={n}, d={d}")
+            print(f"    Cluster size constraints: [{min_size}, {max_size}]")
+    
+        # Use k-means-constrained
+        kmeans = KMeansConstrained(
+            n_clusters=K,
+            size_min=min_size,
+            size_max=max_size,
+            max_iter=max_iter,
+            tol=tol,
+            random_state=random_state,
+            n_init=3,
+            verbose=verbose,
+            n_jobs=16
+        )
+    
+        # Train and get labels
+        labels = kmeans.fit_predict(X)
+        centroids = kmeans.cluster_centers_
 
     print(f"[Time] balanced_kmeans_level_constrained (K={K}): {time.time() - start_time:.2f}s")
 
@@ -60,6 +104,10 @@ def balanced_kmeans_level_constrained(X, K, max_iter=100, tol=1e-7, random_state
         # Check cluster size distribution
         unique, counts = np.unique(labels, return_counts=True)
         print(f"    Cluster sizes: min={counts.min()}, max={counts.max()}, mean={counts.mean():.1f}")
+        # If using fast mode, show imbalance ratio
+        if use_fast:
+             imbalance = counts.max() / counts.mean()
+             print(f"    Imbalance ratio: {imbalance:.2f} (1.0 is perfectly balanced)")
 
     return labels, centroids
 
@@ -92,7 +140,7 @@ def residual_kmeans_constrained(X, K, L, max_iter=300, tol=1e-4, random_state=No
     codes_all = np.empty((L, n), dtype=np.int32)
     codebooks = []
 
-    for l in range(L):
+    for l in tqdm(range(L), desc="Residual K-means Levels"):
         level_start = time.time()
         k_l = Ks[l]
         if verbose:
@@ -167,9 +215,9 @@ def analyze_codes(codes, title="", verbose=True):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Constrained RQ-KMeans clustering")
-    parser.add_argument('--root', type=str, default="./data/Amazon", help="Root directory for data")
-    parser.add_argument("--dataset", type=str, required=True, help="Dataset name (e.g., Industrial_and_Scientific)")
-    parser.add_argument("--k", type=int, default=256, help="Number of clusters per level")
+    parser.add_argument('--root', type=str, default="./yambda/sequential-multievent-500m", help="Root directory for data")
+    parser.add_argument("--dataset", type=str, default="sequential-multievent-500m.item_emb.npy", help="Dataset name (e.g., Industrial_and_Scientific)")
+    parser.add_argument("--k", type=int, default=512, help="Number of clusters per level")
     parser.add_argument("--l", type=int, default=4, help="Number of levels")
     parser.add_argument("--max_iter", type=int, default=100, help="Maximum number of iterations")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
@@ -194,7 +242,7 @@ if __name__ == "__main__":
     t0 = time.time()
     print("root: ", args.root)
     print("dataset: ", args.dataset)
-    data_path = os.path.join(args.root, args.dataset + '.emb-qwen-td.npy')
+    data_path = os.path.join(args.root, args.dataset)
 
     if not os.path.exists(data_path):
         print(f"Error: Data file not found: {data_path}")
@@ -246,10 +294,10 @@ if __name__ == "__main__":
     # Generate JSON index
     t5 = time.time()
     codes_json = {}
-    for id, row in enumerate(codes_dedup.iter_rows(named=True)):
+    for id, row in tqdm(enumerate(codes_dedup.iter_rows(named=True)), total=len(codes_dedup), desc="Generating JSON index"):
         codes_ = []
         for i, code in enumerate(row['codes']):
-            codes_.append(f'<{chr(97+i)}_{code}>')
+            codes_.append(f'<|{chr(97+i)}_{code}|>')
         codes_json[str(id)] = codes_
 
     # Save JSON index
