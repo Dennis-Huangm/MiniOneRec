@@ -260,7 +260,12 @@ def process_shard_sequences(args):
             seq_len = len(item_ids_remapped)
             for k in range(0, seq_len, 20):
                 chunk = item_ids_remapped[k : k + 20]
-                ts = seq_times[min(k + 19, seq_len - 1)]
+                
+                # 只保留长度为20的chunk
+                if len(chunk) != 20:
+                    continue
+                
+                ts = seq_times[k + 19]  # 使用第20个item的时间戳
                 
                 # 优化：转换为 Tuple 和 预处理 String 以减少内存占用
                 # history_seq 转为字符串存储，避免 list overhead
@@ -428,11 +433,11 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset', type=str, default='sequential-multievent-500m')
     # 这里输入应该是包含 DatasetDict 的文件夹路径
-    parser.add_argument('--input_path', type=str, default='/home/huangminrui/datasets/yambda/sequential/500m/sharded/', help='Path to HF Dataset folder')
+    parser.add_argument('--input_path', type=str, default='/home/hongminjie/datasets/yambda/sequential/500m/sharded/', help='Path to HF Dataset folder')
     parser.add_argument('--output_path', type=str, default='./yambda')
     parser.add_argument('--user_k', type=int, default=5)
     parser.add_argument('--item_k', type=int, default=5)
     parser.add_argument('--debug_size', type=int, default=None, help='Use only N samples for testing')
-    parser.add_argument('--emb_path', type=str, default='/home/huangminrui/datasets/yambda/embeddings.parquet')
+    parser.add_argument('--emb_path', type=str, default='/home/hongminjie/datasets/yambda/embeddings.parquet')
     args = parser.parse_args()
     process_data(args)
