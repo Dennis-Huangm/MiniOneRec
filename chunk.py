@@ -3,8 +3,8 @@ import os
 from tqdm import tqdm
 
 # --- 配置 ---
-input_file = '/home/huangminrui/datasets/yambda/sequential/500m/listens.parquet'
-output_dir = '/home/huangminrui/datasets/yambda/sequential/500m/sharded/'
+input_file = '/home/hongminjie/datasets/yambda/sequential/5b/listens.parquet'
+output_dir = '/home/hongminjie/datasets/yambda/sequential/5b/sharded/'
 chunk_size = 25000  # 总共100万行，每次切2.5万行，会生成40个文件，每个约1GB
 
 # 确保输出目录存在
@@ -17,9 +17,12 @@ def split_parquet_polars():
     # low_memory=True 会牺牲一点速度来换取更低的内存占用
     lf = pl.scan_parquet(input_file, low_memory=True)
     
-    # 获取总行数 (利用之前 metadata 里的信息，或者快速计算)
-    # 你日志里已经显示是 100000
-    total_rows = 100000
+    # 动态获取总行数
+    total_rows = lf.select(pl.len()).collect().item()
+    
+    if total_rows == 0:
+        print("❌ 源文件为空，无需切分")
+        return
     
     print(f"总行数: {total_rows}")
     print(f"目标切分: 每份 {chunk_size} 行")

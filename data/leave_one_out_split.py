@@ -95,7 +95,7 @@ def leave_one_out_split(input_file, output_dir=None):
 
 def main():
     parser = argparse.ArgumentParser(description='Leave-One-Out split for sequential dataset')
-    parser.add_argument('input_file', type=str, help='Input .inter file path')
+    parser.add_argument('--input_file', type=str, default='/home/hongminjie/MiniOneRec/yambda/sequential-multievent-500m/sequential-multievent-500m.inter', help='Input .inter file path')
     parser.add_argument('--output_dir', type=str, default=None,
                         help='Output directory (default: same as input file)')
     
